@@ -1,0 +1,108 @@
+name: CI/CD - tickets-app
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: tickets-app
+
+jobs:
+  # 1) Compila y ejecuta las pruebas
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Compilar y ejecutar pruebas
+        run: mvn -B test
+
+  # 2) Construye la imagen Docker y la publica en Docker Hub
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Login en Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Construir y publicar imagen
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  # 3) Despliega en la instancia EC2 con el EFS montado
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Desplegar en EC2 por SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest"
+
+            # --- Montar el EFS si todavía no está montado ---
+            sudo mkdir -p /mnt/efs
+            if ! mountpoint -q /mnt/efs; then
+              echo "Montando EFS en /mnt/efs"
+              sudo mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport \
+                "${{ secrets.EFS_DNS }}:/" /mnt/efs
+            fi
+            df -h /mnt/efs
+
+            # --- Credenciales AWS opcionales (si no se usa el rol LabInstanceProfile) ---
+            CREDS=""
+            if [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+              CREDS="-e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_SESSION_TOKEN=${{ secrets.AWS_SESSION_TOKEN }}"
+            fi
+
+            # --- Reemplazar el contenedor con la nueva imagen ---
+            sudo docker pull "$IMAGE"
+            sudo docker stop tickets-app 2>/dev/null || true
+            sudo docker rm tickets-app 2>/dev/null || true
+            sudo docker run -d --name tickets-app --restart unless-stopped \
+              -p 8080:8080 \
+              -v /mnt/efs:/app/efs \
+              -e AWS_S3_BUCKET="${{ secrets.AWS_S3_BUCKET }}" \
+              -e AWS_REGION="${{ secrets.AWS_REGION }}" \
+              $CREDS \
+              "$IMAGE"
+            sudo docker image prune -f
+
+            # --- Verificar que la aplicación levantó ---
+            for i in $(seq 1 30); do
+              if curl -fs http://localhost:8080/actuator/health > /dev/null; then
+                echo "Aplicación desplegada y saludable"
+                exit 0
+              fi
+              sleep 3
+            done
+            echo "La aplicación no respondió a tiempo"
+            sudo docker logs --tail 100 tickets-app
+            exit 1
